@@ -1,53 +1,83 @@
-from typing import Optional
-from dataclasses import dataclass
+from typing import List, Optional
+from dataclasses import dataclass, fields
+
+
+OPEN_STATUSES = {"PENDING_NEW", "NEW", "PARTIALLY_FILLED", "PENDING_CANCEL", "PENDING_REPLACE", "REPLACED"}
+TERMINAL_STATUSES = {"FILLED", "CANCELED", "REJECTED", "EXPIRED", "DONE_FOR_DAY", "STOPPED"}
+
+
+def _filter_kwargs(cls, data: dict) -> dict:
+    names = {f.name for f in fields(cls)}
+    return {k: v for k, v in data.items() if k in names}
 
 
 @dataclass
 class Order:
-    created_at: int
-    updated_at: int
-    order_id: str
-    version: int
-    account_id: str
-    state: str
-    status: str
+    id: str
+    account_id: int
     symbol: str
-    order_type: str
     side: str
-    quantity: str
+    status: str
+    order_type: str
     time_in_force: str
-    average_price: str
+    quantity: str
     filled_quantity: str
-    price: Optional[str] = None
-    strategy_type: Optional[str] = None
-    order_update_reason: Optional[str] = None
-    reference_id: Optional[str] = None
-    text: Optional[str] = None
+    leaves_quantity: str
+    instrument_type: str
+    created_at: str
+    updated_at: str
+    security_id: Optional[str] = None
+    security_id_source: Optional[str] = None
+    venue: Optional[str] = None
+    client_order_id: Optional[str] = None
+    limit_price: Optional[str] = None
+    stop_price: Optional[str] = None
+    average_fill_price: Optional[str] = None
+    details: Optional[List[str]] = None
+    expires_at: Optional[str] = None
+
+    @classmethod
+    def from_api(cls, data: dict) -> "Order":
+        return cls(**_filter_kwargs(cls, data))
+
+    def is_open(self) -> bool:
+        return self.status in OPEN_STATUSES
+
+    def is_terminal(self) -> bool:
+        return self.status in TERMINAL_STATUSES
 
 
 @dataclass
 class Trade:
-    created_at: int
-    account_id: str
-    trade_id: str
     order_id: str
     symbol: str
     side: str
     quantity: str
     price: str
+    created_at: str
 
 
 @dataclass
 class Position:
-    account_id: str
+    account_id: int
     symbol: str
     quantity: str
+    instrument_type: str = "COMMON_STOCK"
+    security_id: Optional[str] = None
+    security_id_source: Optional[str] = None
+    position_type: Optional[str] = None
+    available_quantity: Optional[str] = None
+    market_value: Optional[str] = None
+
+    @classmethod
+    def from_api(cls, data: dict) -> "Position":
+        return cls(**_filter_kwargs(cls, data))
 
 
 @dataclass
 class EngineConfig:
     url: str
-    auth: str
+    api_key: str
     account: str
     symbol: str
     max_position: int

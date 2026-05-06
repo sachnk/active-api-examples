@@ -6,7 +6,7 @@ import pandas as pd
 
 from dataclasses import dataclass
 from typing import List
-from polygon.websocket.models import EquityQuote
+from massive.websocket.models import EquityQuote
 from common import BaseEngine
 from common.models import Order, EngineConfig
 
@@ -33,7 +33,7 @@ class Engine(BaseEngine):
 
     def on_order_update(self, timestamp: int, order: Order) -> None:
         super().on_order_update(timestamp, order)
-        stats = list(filter(lambda x: x.order_id == order.order_id, self.stats))
+        stats = list(filter(lambda x: x.order_id == order.id, self.stats))
         if len(stats) > 0:
             stats[0].acked_at = timestamp
 
@@ -71,11 +71,11 @@ class Engine(BaseEngine):
         open_sells: List[float] = []
         # cancel orders with insufficient edge
         for order in self.open_orders.values():
-            price = float(order.price)
-            open_buys.append(price) if order.side == "buy" else open_sells.append(price)
+            price = float(order.limit_price)
+            open_buys.append(price) if order.side == "BUY" else open_sells.append(price)
             edge = (
                 math.fabs(self.theo - price)
-                if order.side == "buy"
+                if order.side == "BUY"
                 else math.fabs(price - self.theo)
             )
             if edge < self.min_edge:
@@ -99,7 +99,7 @@ class Engine(BaseEngine):
             if price < self.config.min_tick:
                 break
             size = random.randint(self.config.min_size, self.config.max_size)
-            self.send("buy", size, price)
+            self.send("BUY", size, price)
             price -= self.config.min_tick
 
         price = (
@@ -109,7 +109,7 @@ class Engine(BaseEngine):
         )
         for i in range(self.num_levels - len(open_sells)):
             size = random.randint(self.config.min_size, self.config.max_size)
-            self.send("sell", size, price)
+            self.send("SELL", size, price)
             price += self.config.min_tick
 
         logging.info("---- end eval: theo = %.2f", self.theo)
@@ -117,7 +117,7 @@ class Engine(BaseEngine):
     
     def send(self, side: str, quantity: int, price: float):
         timestamp = int(time.time() * 1000)
-        order_id = self.submit_order(side, quantity, self.to_tick(price), "day")
+        order_id = self.submit_order(side, quantity, self.to_tick(price), "DAY")
         self.stats.append(Stats(submitted_at=timestamp, acked_at=0, order_id=order_id))
 
     def dump_stats(self):

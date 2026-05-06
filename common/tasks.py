@@ -1,18 +1,18 @@
-import json
 import asyncio
-import websockets
 import logging
 import time
 
-from polygon import WebSocketClient
-from polygon.websocket.models import WebSocketMessage, EquityQuote, EquityAgg
-from polygon.websocket.models.common import Feed
+import requests
+from massive import WebSocketClient
+from massive.websocket.models import WebSocketMessage, EquityQuote, EquityAgg
+from massive.websocket.models.common import Feed
+from typing import Dict, List, Optional
+
 from .models import Order, Trade, Position
 from .base_engine import BaseEngine
-from typing import List
 
 
-async def polygon_processor(engine: BaseEngine, msgs: List[WebSocketMessage]):
+async def massive_processor(engine: BaseEngine, msgs: List[WebSocketMessage]):
     for msg in msgs:
         if msg.event_type == "Q":
             msg: EquityQuote = msg
@@ -25,42 +25,109 @@ async def polygon_processor(engine: BaseEngine, msgs: List[WebSocketMessage]):
             engine.on_agg_min_update(msg)
 
 
-async def ws_polgon_task(engine: BaseEngine, symbols: List[str], api_key: str):
+async def ws_massive_task(engine: BaseEngine, symbols: List[str], api_key: str):
     subscriptions = (
         [f"Q.{symbol}" for symbol in symbols]
         + [f"A.{symbol}" for symbol in symbols]
         + [f"AM.{symbol}" for symbol in symbols]
     )
+
     ws = WebSocketClient(
-        api_key=api_key, feed=Feed.PolyFeed, subscriptions=subscriptions, verbose=True
+        api_key=api_key, feed=Feed.RealTime, subscriptions=subscriptions, verbose=True
     )
-    await ws.connect(processor=lambda msgs: polygon_processor(engine, msgs))
+    await ws.connect(processor=lambda msgs: massive_processor(engine, msgs))
 
 
-async def ws_studio_task(engine: BaseEngine, url: str, auth: str, account: str):
-    msg = {
-        "authorization": auth,
-        "payload": {"type": "subscribe-activity", "account_id": account},
-    }
-    url = url.replace("http://", "ws://").replace("https://", "wss://")
-    url = f"{url}/v2/ws"
-    logging.info("connect: %s", url)
+def _fetch_orders(url: str, api_key: str, account: str, symbol: str) -> List[Order]:
+    headers = {"Authorization": f"Bearer {api_key}"}
+    resp = requests.get(
+        f"{url}/accounts/{account}/orders",
+        headers=headers,
+        params={"symbol": symbol, "page_size": 1000},
+    )
+    resp.raise_for_status()
+    return [Order.from_api(o) for o in resp.json().get("data", [])]
 
-    async with websockets.connect(url) as ws:
-        await ws.send(json.dumps(msg))
-        logging.info("studio websocket connected")
-        while True:
-            msg = await ws.recv()
+
+def _fetch_position(url: str, api_key: str, account: str, symbol: str) -> Optional[Position]:
+    headers = {"Authorization": f"Bearer {api_key}"}
+    resp = requests.get(
+        f"{url}/accounts/{account}/positions",
+        headers=headers,
+        params={"page_size": 1000},
+    )
+    resp.raise_for_status()
+    for p in resp.json().get("data", []):
+        if p.get("symbol") == symbol:
+            return Position.from_api(p)
+    return None
+
+
+async def poll_clst_task(
+    engine: BaseEngine,
+    url: str,
+    api_key: str,
+    account: str,
+    symbol: str,
+    interval: float = 1.0,
+):
+    last_orders: Dict[str, Order] = {}
+    last_position_qty: Optional[str] = None
+    first_poll = True
+
+    logging.info("polling %s every %.2fs for %s", url, interval, symbol)
+
+    while True:
+        try:
+            orders = await asyncio.to_thread(_fetch_orders, url, api_key, account, symbol)
             timestamp = int(time.time() * 1000)
-            payload = json.loads(msg)["payload"]
-            if payload["type"] == "order-update":
-                engine.on_order_update(timestamp, Order(**payload["data"]))
-            elif payload["type"] == "trade-notice":
-                engine.on_trade_notice(timestamp, Trade(**payload["data"]))
-            elif payload["type"] == "position-update":
-                engine.on_position_update(timestamp, Position(**payload["data"]))
-            elif payload["type"] == "replay-complete":
+
+            for order in orders:
+                prev = last_orders.get(order.id)
+                changed = (
+                    prev is None
+                    or prev.status != order.status
+                    or prev.filled_quantity != order.filled_quantity
+                )
+                if not changed:
+                    continue
+
+                prev_filled = float(prev.filled_quantity) if prev else 0.0
+                curr_filled = float(order.filled_quantity)
+                if curr_filled > prev_filled:
+                    fill_qty = curr_filled - prev_filled
+                    fill_price = order.average_fill_price or order.limit_price or "0"
+                    engine.on_trade_notice(
+                        timestamp,
+                        Trade(
+                            order_id=order.id,
+                            symbol=order.symbol,
+                            side=order.side,
+                            quantity=str(int(fill_qty) if fill_qty.is_integer() else fill_qty),
+                            price=fill_price,
+                            created_at=order.updated_at,
+                        ),
+                    )
+
+                engine.on_order_update(timestamp, order)
+                last_orders[order.id] = order
+
+            position = await asyncio.to_thread(_fetch_position, url, api_key, account, symbol)
+            if position is None:
+                position = Position(account_id=0, symbol=symbol, quantity="0")
+
+            if last_position_qty != position.quantity:
+                engine.on_position_update(timestamp, position)
+                last_position_qty = position.quantity
+
+            if first_poll:
+                first_poll = False
                 engine.on_ready()
+
+        except requests.RequestException:
+            logging.exception("clst poll failed")
+
+        await asyncio.sleep(interval)
 
 
 async def timer_task(engine: BaseEngine):

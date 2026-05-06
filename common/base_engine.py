@@ -1,7 +1,7 @@
 import logging
 import requests
-from typing import Dict, List, Union
-from polygon.websocket.models import EquityQuote, EquityAgg
+from typing import Dict, List
+from massive.websocket.models import EquityQuote, EquityAgg
 from .models import Order, Trade, Position, EngineConfig
 
 
@@ -17,35 +17,35 @@ class BaseEngine:
         self.agg_sec: Dict[str, EquityAgg] = {}
         self.agg_min: Dict[str, EquityAgg] = {}
         self.config.validate()
-        self.cancel_all_orders()
+        #self.cancel_all_orders()
 
-    # invoked when all replayed data has been received
+    # invoked when the first poll cycle completes
     def on_ready(self):
         self.ready = True
         logging.info(
             "%s engine ready, position = %d", self.config.symbol, self.position
         )
 
-    # invoked when an order state updates from studio
+    # invoked when an order state updates
     def on_order_update(self, timestamp: int, order: Order) -> None:
-        if not order.order_id in self.submitted_orders:
+        if order.id not in self.submitted_orders:
             return
 
         if order.symbol != self.config.symbol:
             return
 
-        if order.state == "rejected":
-            logging.warn("Order %s rejected: %s", order.order_id, order.text)
+        if order.status == "REJECTED":
+            logging.warn("Order %s rejected: %s", order.id, order.details)
             self.num_rejects += 1
             if self.num_rejects >= self.config.max_rejects:
                 raise RuntimeError("Too many rejects")
 
-        if order.state != "open":
-            self.open_orders.pop(order.order_id, None)
+        if order.is_open():
+            self.open_orders[order.id] = order
         else:
-            self.open_orders[order.order_id] = order
+            self.open_orders.pop(order.id, None)
 
-    # invoked when a trade occurs against an open order from studio
+    # invoked when a fill is detected against an open order
     def on_trade_notice(self, timestamp: int, trade: Trade) -> None:
         if trade.symbol != self.config.symbol:
             return
@@ -58,23 +58,23 @@ class BaseEngine:
             trade.price,
         )
 
-    # invoked when a position update occurs from studio
+    # invoked when a position update is detected
     def on_position_update(self, timestamp: int, position: Position) -> None:
         if position.symbol != self.config.symbol:
             return
 
-        self.position = int(position.quantity)
+        self.position = int(float(position.quantity))
         logging.info("%s position: %s", self.config.symbol, self.position)
 
-    # invoked when a quote update occurs from polygon
+    # invoked when a quote update occurs from massive
     def on_quote_update(self, quote: EquityQuote) -> None:
         self.quotes[quote.symbol] = quote
 
-    # invoked when a second aggregate update occurs from polygon
+    # invoked when a second aggregate update occurs from massive
     def on_agg_sec_update(self, agg: EquityAgg) -> None:
         self.agg_sec[agg.symbol] = agg
 
-    # invoked when a minute aggregate update occurs from polygon
+    # invoked when a minute aggregate update occurs from massive
     def on_agg_min_update(self, agg: EquityAgg) -> None:
         self.agg_min[agg.symbol] = agg
 
@@ -85,62 +85,68 @@ class BaseEngine:
         logging.info("Submitting order: %s %d @ %s...", side, quantity, price)
 
         if self.position > 0:
-            if side == "buy":
+            if side == "BUY":
                 if self.position + quantity > self.config.max_position:
                     logging.info("Cannot submit order; max position will breach")
                     return
             else:
                 quantity = min(quantity, self.position)
         elif self.position < 0:
-            if side == "sell":
+            if side == "SELL":
                 if self.position - quantity < -self.config.max_position:
                     logging.info("Cannot submit order; max position will breach")
                     return
             else:
                 quantity = min(quantity, -self.position)
 
-        url = f"{self.config.url}/v2/accounts/{self.config.account}/orders"
-        headers = {"Authorization": f"Bearer {self.config.auth}"}
+        url = f"{self.config.url}/accounts/{self.config.account}/orders"
+        headers = {"Authorization": f"Bearer {self.config.api_key}"}
         response = requests.post(
             url,
             headers=headers,
-            json={
-                "symbol": self.config.symbol,
-                "side": side,
-                "quantity": str(quantity),
-                "price": price,
-                "order_type": "limit",
-                "time_in_force": tif,
-                "strategy_type": "sor",
-            },
+            json=[
+                {
+                    "instrument_type": "COMMON_STOCK",
+                    "symbol": self.config.symbol,
+                    "side": side,
+                    "quantity": str(quantity),
+                    "limit_price": price,
+                    "order_type": "LIMIT",
+                    "time_in_force": tif,
+                    "strategy": {"type": "SOR"},
+                }
+            ],
         )
-        if response.status_code != 201:
+        if not response.ok:
             raise RuntimeError(
                 f"Failed submitting order: {response.status_code}, {response.text}"
             )
 
-        order_id = response.json()["order_id"]
+        order_id = response.json()["data"][0]["id"]
         self.submitted_orders.append(order_id)
         logging.info("Submitted order-id %s", order_id)
 
         return order_id
 
     def cancel_order(self, order: Order) -> None:
-        url = f"{self.config.url}/v2/accounts/{self.config.account}/orders/{order.order_id}"
-        headers = {"Authorization": f"Bearer {self.config.auth}"}
+        url = f"{self.config.url}/accounts/{self.config.account}/orders/{order.id}"
+        headers = {"Authorization": f"Bearer {self.config.api_key}"}
         response = requests.delete(url, headers=headers)
-        if response.status_code != 201:
+        if not response.ok:
             raise RuntimeError(
                 f"Failed cancelling order: {response.status_code}, {response.text}"
             )
 
-        logging.info("Cancelled order: %s", order.order_id)
+        logging.info("Cancelled order: %s", order.id)
 
     def cancel_all_orders(self) -> None:
-        url = f"{self.config.url}/v2/accounts/{self.config.account}/orders"
-        headers = {"Authorization": f"Bearer {self.config.auth}"}
+        url = f"{self.config.url}/accounts/{self.config.account}/orders"
+        headers = {"Authorization": f"Bearer {self.config.api_key}"}
         response = requests.delete(url, headers=headers)
-        if response.status_code != 201:
+        if response.status_code == 404:
+            logging.info("No orders to cancel")
+            return
+        if not response.ok:
             raise RuntimeError(
                 f"Failed cancelling all orders: {response.status_code}, {response.text}"
             )
