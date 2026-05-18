@@ -5,10 +5,14 @@ import time
 import pandas as pd
 
 from dataclasses import dataclass
-from typing import List
+from typing import List, Tuple
 from massive.websocket.models import EquityQuote
 from common import BaseEngine
 from common.models import Order, EngineConfig
+
+# (price, qty, edge, status) where status is "kept", "cancelled", or "submitted"
+BookRow = Tuple[float, int, float, str]
+
 
 @dataclass
 class Stats:
@@ -16,9 +20,13 @@ class Stats:
     acked_at: int
     order_id: str
 
+
 class Engine(BaseEngine):
-    def __init__(self, config: EngineConfig, min_edge: float, num_levels: int):
+    def __init__(self, config: EngineConfig, side: str, min_edge: float, num_levels: int):
         super().__init__(config)
+        if side not in ("BUY", "SELL"):
+            raise ValueError("side must be BUY or SELL")
+        self.side = side
         self.min_edge = min_edge
         self.num_levels = num_levels
         self.theo: float = math.nan
@@ -56,73 +64,113 @@ class Engine(BaseEngine):
         if self.eval():
             self.dirty = False
 
+    def _edge(self, price: float) -> float:
+        return (
+            math.fabs(self.theo - price)
+            if self.side == "BUY"
+            else math.fabs(price - self.theo)
+        )
+
     def eval(self) -> bool:
         if not self.ready:
             return False
 
-        logging.info("---- begin eval: theo = %.2f", self.theo)
-
         if math.isnan(self.theo):
-            logging.info("no theo; cancelling all orders")
+            logging.info("%s %s: no theo; cancelling all orders", self.config.symbol, self.side)
             self.cancel_all_orders()
             return True
 
-        open_buys: List[float] = []
-        open_sells: List[float] = []
-        # cancel orders with insufficient edge
-        for order in self.open_orders.values():
+        rows: List[BookRow] = []
+
+        # cancel orders with insufficient edge; collect survivors. Snapshot
+        # the values: cancel_order() may pop from self.open_orders on a 4xx,
+        # which would otherwise mutate the dict mid-iteration.
+        survivor_prices: List[float] = []
+        for order in list(self.open_orders.values()):
             price = float(order.limit_price)
-            open_buys.append(price) if order.side == "BUY" else open_sells.append(price)
-            edge = (
-                math.fabs(self.theo - price)
-                if order.side == "BUY"
-                else math.fabs(price - self.theo)
-            )
+            qty = int(order.leaves_quantity)
+            edge = self._edge(price)
             if edge < self.min_edge:
-                logging.info(
-                    "%s @ %.2f, edge=%.3f, cancelling...", order.side, price, edge
-                )
                 self.cancel_order(order)
+                rows.append((price, qty, edge, "cancelled"))
             else:
-                logging.info("%s @ %.2f, edge=%.3f", order.side, price, edge)
+                rows.append((price, qty, edge, "kept"))
+                survivor_prices.append(price)
 
-        open_buys.sort()
-        open_sells.sort()
+        survivor_prices.sort()
 
-        # fill in missing levels
-        price = (
-            open_buys[0] - self.config.min_tick
-            if len(open_buys) > 0
-            else self.theo - self.min_edge
-        )
-        for i in range(self.num_levels - len(open_buys)):
+        # fill in missing levels, walking away from theo by min_tick
+        if self.side == "BUY":
+            price = (
+                survivor_prices[0] - self.config.min_tick
+                if survivor_prices
+                else self.theo - self.min_edge
+            )
+            step = -self.config.min_tick
+        else:
+            price = (
+                survivor_prices[-1] - self.config.min_tick
+                if survivor_prices
+                else self.theo + self.min_edge
+            )
+            step = self.config.min_tick
+
+        for _ in range(self.num_levels - len(survivor_prices)):
             if price < self.config.min_tick:
                 break
             size = random.randint(self.config.min_size, self.config.max_size)
-            self.send("BUY", size, price)
-            price -= self.config.min_tick
+            self.send(size, price)
+            rows.append((price, size, self._edge(price), "submitted"))
+            price += step
 
-        price = (
-            open_sells[-1] - self.config.min_tick
-            if len(open_sells) > 0
-            else self.theo + self.min_edge
-        )
-        for i in range(self.num_levels - len(open_sells)):
-            size = random.randint(self.config.min_size, self.config.max_size)
-            self.send("SELL", size, price)
-            price += self.config.min_tick
-
-        logging.info("---- end eval: theo = %.2f", self.theo)
+        # Suppress the book panel when this eval was a no-op (every row "kept",
+        # i.e. no cancels and no new submits).
+        if any(status != "kept" for _, _, _, status in rows):
+            self._render_book(rows)
         return True
-    
-    def send(self, side: str, quantity: int, price: float):
+
+    def _render_book(self, rows: List[BookRow]) -> None:
+        """Print a price-sorted ladder of our orders with theo/bbo markers."""
+        quote = self.quotes.get(self.config.symbol)
+
+        # Build the ladder: each entry is (price, kind, payload).
+        ladder = [(p, "order", (q, e, s)) for p, q, e, s in rows]
+        ladder.append((self.theo, "marker", "theo"))
+        if quote:
+            ladder.append((float(quote.bid_price), "marker", "bid"))
+            ladder.append((float(quote.ask_price), "marker", "ask"))
+        ladder.sort(key=lambda x: x[0], reverse=True)
+
+        bbo = (
+            f"{float(quote.bid_price):.2f} / {float(quote.ask_price):.2f}"
+            if quote else "n/a"
+        )
+        header = (
+            f"{self.config.symbol} {self.side}  "
+            f"pos={self.position}  theo={self.theo:.2f}  bbo={bbo}"
+        )
+
+        lines = ["", f"  ╭─ {header}", "  │"]
+        for price, kind, payload in ladder:
+            if kind == "marker":
+                lines.append(f"  │   {price:>8.2f}   ··· {payload} ···")
+            else:
+                qty, edge, status = payload
+                sigil = {"kept": " ", "cancelled": "✗", "submitted": "+"}[status]
+                tag = "" if status == "kept" else f"  {status}"
+                lines.append(
+                    f"  │ {sigil} {price:>8.2f}   {qty:>5}    e={edge:.2f}{tag}"
+                )
+        lines.append("  ╰─")
+
+        logging.info("\n".join(lines))
+
+    def send(self, quantity: int, price: float):
         timestamp = int(time.time() * 1000)
-        order_id = self.submit_order(side, quantity, self.to_tick(price), "DAY")
+        order_id = self.submit_order(self.side, quantity, self.to_tick(price), "DAY")
         self.stats.append(Stats(submitted_at=timestamp, acked_at=0, order_id=order_id))
 
     def dump_stats(self):
         df = pd.DataFrame([x.acked_at - x.submitted_at for x in self.stats], columns=["latency"])
         logging.info("latency data:\n%s", df.describe())
         logging.info("latency percentiles:\n%s", df["latency"].quantile([0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]))
-
-

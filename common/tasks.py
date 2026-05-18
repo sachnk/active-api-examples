@@ -12,8 +12,13 @@ from .models import Order, Trade, Position
 from .base_engine import BaseEngine
 
 
-async def massive_processor(engine: BaseEngine, msgs: List[WebSocketMessage]):
+async def massive_processor(
+    sym_to_engine: Dict[str, BaseEngine], msgs: List[WebSocketMessage]
+):
     for msg in msgs:
+        engine = sym_to_engine.get(msg.symbol)
+        if engine is None:
+            continue
         if msg.event_type == "Q":
             msg: EquityQuote = msg
             engine.on_quote_update(msg)
@@ -25,7 +30,9 @@ async def massive_processor(engine: BaseEngine, msgs: List[WebSocketMessage]):
             engine.on_agg_min_update(msg)
 
 
-async def ws_massive_task(engine: BaseEngine, symbols: List[str], api_key: str):
+async def ws_massive_task(engines: List[BaseEngine], api_key: str):
+    sym_to_engine = {e.config.symbol: e for e in engines}
+    symbols = list(sym_to_engine.keys())
     subscriptions = (
         [f"Q.{symbol}" for symbol in symbols]
         + [f"A.{symbol}" for symbol in symbols]
@@ -35,7 +42,7 @@ async def ws_massive_task(engine: BaseEngine, symbols: List[str], api_key: str):
     ws = WebSocketClient(
         api_key=api_key, feed=Feed.RealTime, subscriptions=subscriptions, verbose=True
     )
-    await ws.connect(processor=lambda msgs: massive_processor(engine, msgs))
+    await ws.connect(processor=lambda msgs: massive_processor(sym_to_engine, msgs))
 
 
 def _fetch_orders(url: str, api_key: str, account: str, symbol: str) -> List[Order]:

@@ -17,10 +17,10 @@ class BaseEngine:
         self.agg_sec: Dict[str, EquityAgg] = {}
         self.agg_min: Dict[str, EquityAgg] = {}
         self.config.validate()
-        #self.cancel_all_orders()
 
     # invoked when the first poll cycle completes
     def on_ready(self):
+        self.cancel_all_orders()
         self.ready = True
         logging.info(
             "%s engine ready, position = %d", self.config.symbol, self.position
@@ -132,6 +132,16 @@ class BaseEngine:
         url = f"{self.config.url}/accounts/{self.config.account}/orders/{order.id}"
         headers = {"Authorization": f"Bearer {self.config.api_key}"}
         response = requests.delete(url, headers=headers)
+        # 4xx means the order isn't in a cancellable state (404 = unknown id,
+        # 409/422 = already filled/cancelled). Treat as a benign race: drop our
+        # local view of the order and move on. The next poll will reconcile.
+        if 400 <= response.status_code < 500:
+            logging.warning(
+                "Cancel of %s returned %d: %s",
+                order.id, response.status_code, response.text,
+            )
+            self.open_orders.pop(order.id, None)
+            return
         if not response.ok:
             raise RuntimeError(
                 f"Failed cancelling order: {response.status_code}, {response.text}"
@@ -143,8 +153,10 @@ class BaseEngine:
         url = f"{self.config.url}/accounts/{self.config.account}/orders"
         headers = {"Authorization": f"Bearer {self.config.api_key}"}
         response = requests.delete(url, headers=headers)
-        if response.status_code == 404:
-            logging.info("No orders to cancel")
+        if 400 <= response.status_code < 500:
+            logging.info(
+                "Cancel-all returned %d: %s", response.status_code, response.text
+            )
             return
         if not response.ok:
             raise RuntimeError(

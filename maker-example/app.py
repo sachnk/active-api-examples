@@ -11,66 +11,70 @@ from maker.engine import Engine
 from common.models import EngineConfig
 from common import add_common_args, ws_massive_task, poll_clst_task, timer_task
 
-engine: Engine = None
+engines: list[Engine] = []
 
 def signal_handler(sig, frame):
-    engine.cancel_all_orders()
+    for engine in engines:
+        engine.cancel_all_orders()
     logging.info("Dumping stats...")
-    engine.dump_stats()
+    for engine in engines:
+        engine.dump_stats()
     sys.exit(0)
 
-async def main(args):
-    global engine
-
-    logging.basicConfig(
-        format="%(asctime)s.%(msecs)03d %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        level=logging.INFO,
-    )
-
+def _build_engine(args, symbol: str, side: str) -> Engine:
     config = EngineConfig(
         url=args.url,
         api_key=args.api_key,
         account=args.account,
-        symbol=args.symbol,
+        symbol=symbol,
         max_position=args.max_position,
         min_tick=args.min_tick,
         min_size=args.min_size,
         max_size=args.max_size,
         max_rejects=4,
     )
-    engine = Engine(config=config, min_edge=args.min_edge, num_levels=args.levels)
+    return Engine(
+        config=config, side=side, min_edge=args.min_edge, num_levels=args.levels
+    )
+
+async def main(args):
+    logging.basicConfig(
+        format="%(asctime)s.%(msecs)03d %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        level=logging.INFO,
+    )
+
+    engines.append(_build_engine(args, args.s1, "BUY"))
+    engines.append(_build_engine(args, args.s2, "SELL"))
 
     signal.signal(signal.SIGINT, signal_handler)
 
     async with asyncio.TaskGroup() as tg:
-        tg.create_task(
-            ws_massive_task(
-                engine=engine, symbols=[args.symbol], api_key=args.massive_api_key
+        tg.create_task(ws_massive_task(engines=engines, api_key=args.massive_api_key))
+        for engine in engines:
+            tg.create_task(
+                poll_clst_task(
+                    engine=engine,
+                    url=args.url,
+                    api_key=args.api_key,
+                    account=args.account,
+                    symbol=engine.config.symbol,
+                    interval=args.poll_interval,
+                )
             )
-        )
-        tg.create_task(
-            poll_clst_task(
-                engine=engine,
-                url=args.url,
-                api_key=args.api_key,
-                account=args.account,
-                symbol=args.symbol,
-                interval=args.poll_interval,
-            )
-        )
-        tg.create_task(timer_task(engine=engine))
+            tg.create_task(timer_task(engine=engine))
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="An example maker bot using Clear Street Studio's APIs"
+        description="An example single-sided maker bot using Clear Street's Active API"
     )
-    parser.add_argument("symbol", type=str, help="The symbol to trade")
+    parser.add_argument("s1", type=str, help="The symbol to BUY (bid-side only)")
+    parser.add_argument("s2", type=str, help="The symbol to SELL (ask-side only)")
     add_common_args(parser)
 
     parser.add_argument(
-        "--levels", type=int, help="Number of levels to quote", default=3
+        "--levels", type=int, help="Number of levels to quote per side", default=3
     )
     parser.add_argument(
         "--min-edge", type=float, help="Minimum edge around theo", default=0.50
