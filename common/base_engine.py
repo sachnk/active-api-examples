@@ -1,4 +1,5 @@
 import logging
+import time
 import requests
 from typing import Dict, List
 from massive.websocket.models import EquityQuote, EquityAgg
@@ -16,6 +17,9 @@ class BaseEngine:
         self.quotes: Dict[str, EquityQuote] = {}
         self.agg_sec: Dict[str, EquityAgg] = {}
         self.agg_min: Dict[str, EquityAgg] = {}
+        # Per-request roundtrip latencies (ms) for completed HTTP responses.
+        self.submit_latencies: List[float] = []
+        self.cancel_latencies: List[float] = []
         self.config.validate()
 
     # invoked when the first poll cycle completes
@@ -101,6 +105,7 @@ class BaseEngine:
 
         url = f"{self.config.url}/accounts/{self.config.account}/orders"
         headers = {"Authorization": f"Bearer {self.config.api_key}"}
+        t_start = time.perf_counter()
         response = requests.post(
             url,
             headers=headers,
@@ -117,6 +122,7 @@ class BaseEngine:
                 }
             ],
         )
+        self.submit_latencies.append((time.perf_counter() - t_start) * 1000)
         if not response.ok:
             raise RuntimeError(
                 f"Failed submitting order: {response.status_code}, {response.text}"
@@ -131,7 +137,9 @@ class BaseEngine:
     def cancel_order(self, order: Order) -> None:
         url = f"{self.config.url}/accounts/{self.config.account}/orders/{order.id}"
         headers = {"Authorization": f"Bearer {self.config.api_key}"}
+        t_start = time.perf_counter()
         response = requests.delete(url, headers=headers)
+        self.cancel_latencies.append((time.perf_counter() - t_start) * 1000)
         # 4xx means the order isn't in a cancellable state (404 = unknown id,
         # 409/422 = already filled/cancelled). Treat as a benign race: drop our
         # local view of the order and move on. The next poll will reconcile.
@@ -152,7 +160,9 @@ class BaseEngine:
     def cancel_all_orders(self) -> None:
         url = f"{self.config.url}/accounts/{self.config.account}/orders"
         headers = {"Authorization": f"Bearer {self.config.api_key}"}
+        t_start = time.perf_counter()
         response = requests.delete(url, headers=headers)
+        self.cancel_latencies.append((time.perf_counter() - t_start) * 1000)
         if 400 <= response.status_code < 500:
             logging.info(
                 "Cancel-all returned %d: %s", response.status_code, response.text

@@ -1,10 +1,8 @@
 import logging
 import math
 import random
-import time
 import pandas as pd
 
-from dataclasses import dataclass
 from typing import List, Tuple
 from massive.websocket.models import EquityQuote
 from common import BaseEngine
@@ -12,13 +10,6 @@ from common.models import Order, EngineConfig
 
 # (price, qty, edge, status) where status is "kept", "cancelled", or "submitted"
 BookRow = Tuple[float, int, float, str]
-
-
-@dataclass
-class Stats:
-    submitted_at: int
-    acked_at: int
-    order_id: str
 
 
 class Engine(BaseEngine):
@@ -31,7 +22,6 @@ class Engine(BaseEngine):
         self.num_levels = num_levels
         self.theo: float = math.nan
         self.dirty = False
-        self.stats: List[Stats] = []
 
         if self.min_edge < 0:
             raise ValueError("min_edge must be greater than 0")
@@ -41,10 +31,6 @@ class Engine(BaseEngine):
 
     def on_order_update(self, timestamp: int, order: Order) -> None:
         super().on_order_update(timestamp, order)
-        stats = list(filter(lambda x: x.order_id == order.id, self.stats))
-        if len(stats) > 0:
-            stats[0].acked_at = timestamp
-
         self.dirty = True
 
     def on_quote_update(self, quote: EquityQuote) -> None:
@@ -119,7 +105,7 @@ class Engine(BaseEngine):
             if price < self.config.min_tick:
                 break
             size = random.randint(self.config.min_size, self.config.max_size)
-            self.send(size, price)
+            self.submit_order(self.side, size, self.to_tick(price), "DAY")
             rows.append((price, size, self._edge(price), "submitted"))
             price += step
 
@@ -165,12 +151,21 @@ class Engine(BaseEngine):
 
         logging.info("\n".join(lines))
 
-    def send(self, quantity: int, price: float):
-        timestamp = int(time.time() * 1000)
-        order_id = self.submit_order(self.side, quantity, self.to_tick(price), "DAY")
-        self.stats.append(Stats(submitted_at=timestamp, acked_at=0, order_id=order_id))
-
     def dump_stats(self):
-        df = pd.DataFrame([x.acked_at - x.submitted_at for x in self.stats], columns=["latency"])
-        logging.info("latency data:\n%s", df.describe())
-        logging.info("latency percentiles:\n%s", df["latency"].quantile([0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]))
+        for label, samples in (
+            ("submit", self.submit_latencies),
+            ("cancel", self.cancel_latencies),
+        ):
+            if not samples:
+                logging.info("%s %s latency: no samples", self.config.symbol, label)
+                continue
+            df = pd.DataFrame(samples, columns=["latency_ms"])
+            logging.info(
+                "%s %s latency (ms) — describe:\n%s",
+                self.config.symbol, label, df.describe(),
+            )
+            logging.info(
+                "%s %s latency (ms) — percentiles:\n%s",
+                self.config.symbol, label,
+                df["latency_ms"].quantile([0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]),
+            )
