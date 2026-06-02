@@ -103,25 +103,23 @@ class BaseEngine:
             else:
                 quantity = min(quantity, -self.position)
 
+        order_body = {
+            "instrument_type": self.config.instrument_type,
+            "symbol": self.config.symbol,
+            "side": side,
+            "quantity": str(quantity),
+            "limit_price": price,
+            "order_type": "LIMIT",
+            "time_in_force": tif,
+            "strategy": {"type": "SOR"},
+        }
+        if self.config.position_effect is not None:
+            order_body["position_effect"] = self.config.position_effect
+
         url = f"{self.config.url}/accounts/{self.config.account}/orders"
         headers = {"Authorization": f"Bearer {self.config.api_key}"}
         t_start = time.perf_counter()
-        response = requests.post(
-            url,
-            headers=headers,
-            json=[
-                {
-                    "instrument_type": "COMMON_STOCK",
-                    "symbol": self.config.symbol,
-                    "side": side,
-                    "quantity": str(quantity),
-                    "limit_price": price,
-                    "order_type": "LIMIT",
-                    "time_in_force": tif,
-                    "strategy": {"type": "SOR"},
-                }
-            ],
-        )
+        response = requests.post(url, headers=headers, json=[order_body])
         self.submit_latencies.append((time.perf_counter() - t_start) * 1000)
         if not response.ok:
             raise RuntimeError(

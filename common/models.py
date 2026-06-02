@@ -85,6 +85,8 @@ class EngineConfig:
     max_size: int
     min_tick: float
     max_rejects: int
+    instrument_type: str = "COMMON_STOCK"
+    position_effect: Optional[str] = None
 
     def validate(self):
         if self.min_tick < 0:

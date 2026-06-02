@@ -5,18 +5,32 @@ import time
 import requests
 from massive import WebSocketClient
 from massive.websocket.models import WebSocketMessage, EquityQuote, EquityAgg
-from massive.websocket.models.common import Feed
+from massive.websocket.models.common import Feed, Market
 from typing import Dict, List, Optional
 
 from .models import Order, Trade, Position
 from .base_engine import BaseEngine
 
 
+def _normalize_option_symbol(s: str) -> str:
+    """Strip spaces and an optional 'O:' prefix from an option symbol.
+
+    Clear Street returns OSI with spaces (``AAPL  260320C00180000``); Massive
+    uses no spaces with an ``O:`` prefix on the wire (``O:AAPL260320C00180000``).
+    We normalize both to spaceless-no-prefix so they can be matched."""
+    s = s.replace(" ", "")
+    if s.startswith("O:"):
+        s = s[2:]
+    return s
+
+
 async def massive_processor(
     sym_to_engine: Dict[str, BaseEngine], msgs: List[WebSocketMessage]
 ):
     for msg in msgs:
-        engine = sym_to_engine.get(msg.symbol)
+        engine = sym_to_engine.get(msg.symbol) or sym_to_engine.get(
+            _normalize_option_symbol(msg.symbol)
+        )
         if engine is None:
             continue
         if msg.event_type == "Q":
@@ -30,17 +44,41 @@ async def massive_processor(
             engine.on_agg_min_update(msg)
 
 
-async def ws_massive_task(engines: List[BaseEngine], api_key: str):
-    sym_to_engine = {e.config.symbol: e for e in engines}
-    symbols = list(sym_to_engine.keys())
+async def ws_massive_task(
+    engines: List[BaseEngine],
+    api_key: str,
+    market: Market = Market.Stocks,
+):
+    """Subscribe to Massive quotes/aggregates for each engine's symbol.
+
+    For ``Market.Options`` the engine's ``config.symbol`` is expected to be the
+    OSI form *with* spaces (the order-submission shape); the WS subscription
+    string is built by stripping spaces and prepending ``O:``."""
+    if market == Market.Options:
+        sub_symbols = {
+            "O:" + e.config.symbol.replace(" ", ""): e for e in engines
+        }
+        # Dispatcher key: spaceless-no-prefix; tolerate either form via _normalize_.
+        sym_to_engine = {
+            e.config.symbol.replace(" ", ""): e for e in engines
+        }
+    else:
+        sub_symbols = {e.config.symbol: e for e in engines}
+        sym_to_engine = {e.config.symbol: e for e in engines}
+
+    wire_symbols = list(sub_symbols.keys())
     subscriptions = (
-        [f"Q.{symbol}" for symbol in symbols]
-        + [f"A.{symbol}" for symbol in symbols]
-        + [f"AM.{symbol}" for symbol in symbols]
+        [f"Q.{s}" for s in wire_symbols]
+        + [f"A.{s}" for s in wire_symbols]
+        + [f"AM.{s}" for s in wire_symbols]
     )
 
     ws = WebSocketClient(
-        api_key=api_key, feed=Feed.RealTime, subscriptions=subscriptions, verbose=True
+        api_key=api_key,
+        feed=Feed.RealTime,
+        market=market,
+        subscriptions=subscriptions,
+        verbose=True,
     )
     await ws.connect(processor=lambda msgs: massive_processor(sym_to_engine, msgs))
 
